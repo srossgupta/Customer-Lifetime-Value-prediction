@@ -1,0 +1,603 @@
+---
+title: "Data Mining Project - Cards CLV"
+author: "The Mean Squares"
+date: 'Submitted: December 15, 2017'
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: cerulean
+    highlight: tango
+---
+In this project, we would like to meet the 3 main objectives of our customer which include
+- To predict Customer Churn Behavior
+    + Logistic Regression and Random Forest Models have been used to for this purpose
+- To estimate the Customer Lifetime Value 
+    + Linear Regression Model has been fitted for estimation
+- Customer Segmentation (which includes sleeping customers)
+    + Unsupervised learning methods such as K-means and Hierarchical Clustering have been used to get the various segments
+    + Sleeping customers are defined as users who are no longer active but have not yet cancelled their subscription 
+
+Lets now explore the above in detail.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Let's first load the packages. 
+
+## Preamble 1: Loading packages
+```{r, warning=FALSE}
+
+require(ggplot2)
+require(plyr)
+require(party)
+require(partykit)
+# better summary tables
+require(psych)
+# visualize regression
+require(visreg) 
+require(zoo)
+require(mondate)
+require(lubridate)
+require(dplyr)
+require(pROC)
+require(sqldf)
+require(RSQLite)
+require(tcltk2)
+require(caret)
+require(glmnet)
+require(e1071)
+require(randomForest)
+require(sparcl)
+require(corr)
+require(leaps)
+require(knitr)
+```
+
+Then, proceed to load the data. 
+
+## Preamble 2: Loading Data 
+
+```{r, warning=FALSE}
+# import dataset from file (change the directory to where your data is stored)
+setwd("/Users/srossgupta/Desktop/Data Mining/Project")
+
+cards=read.csv("ltv.csv")
+```
+
+
+## Performing Data Transformation
+
+`Handling of Categorical Variables:`
+- The 'status column' in the ltv dataset is a categorical variabe. 
+- We have re-coded it from '0'- new, '1'- open, '2'- cancelation event to 0 - not churned(as long as status is 0 or 1) and 1 - churned(status = 2). 
+- Other categorical variables include gender, entered, completed and holiday. The latter 3 have been used to derive synthetic variables. 
+
+```{r, warning=FALSE}
+# Converting Churn to a boolean for the purpose of our analysis
+# 1 - Churn, 0 - Not Churned
+Churn <- with(cards, ifelse(status < 2, 0, 1))
+# Place the data into a data frame
+cards <- data.frame(cards, Churn)
+
+```
+
+
+`Creation of important synthetic variables:`
+- total.pages: Total number of pages visited by user
+- total.minutes: Total number of minutes spent by user
+- total.entered: Total number of order path entries by user
+- total.completed: Total number of completed orders by user
+- total.holiday: Total number of completed orders by user which included at least 1 holiday card by user
+- total.days = max(as.Date(date)) - min(as.Date(date)))
+- pages.per.min: Total user minutes/Total Number of pages visted by user
+- completed.ratio - Total orders completed by user/Total number of trials user entered the order path
+- holiday.ratio -Total number of completed orders by user which included at least 1 holiday card/Total number of completed orders by user
+- completed.per.min - Total orders completed by user/Total number of minutes spent by user
+- entered.per.min - Total number of trials user entered the order path/Total user minutes
+- pages.per.entered - Total Number of pages visted by user/Total number of trials user entered the order path
+- total.months - total.days/30 (assumption of 1 month = 30 days)
+
+We looked at the mean user tenure and it gave us 560 days ~ roughly 1.5 years with a sd of 1 year. Therefore, we chose to observe a window of 6 months as our early behavior to predict how long the user will take to churn.
+
+There can be users who cancelled their subscription and resubscribed. In our dataset, we noticed that there were 2 such cases. We are handling this case by considering user's latest status and not the intermediate ones. 
+
+```{r, warning=FALSE}
+#cards$date <- as.Date(cards$date, format = "%d/%m/%y")
+cards$date <- mdy(cards$date)
+cards$month = format(as.POSIXct(cards$date),"%m")
+cards$year = format(as.POSIXct(cards$date),"%y")
+#convert time-period into quarters
+cards$qtrs = as.yearqtr(as.Date(cards$date))
+#convert time-period in half yearly period (looks irrelelvant to me)
+cards$halfyear = semester(as.Date(cards$date), with_year = TRUE)
+#synthetic variable : no. of time you spend on pages
+cards$pagePerMin= ifelse(cards$onsite==0,0,cards$pages/cards$onsite)
+
+#creation of card.resp data frame which has the summary of the below important variables
+cards.resp = cards %>%
+  group_by(id) %>%
+  summarise(total.pages=sum(pages),
+            total.minutes = sum(onsite),
+            total.entered = sum(entered),
+            total.completed = sum(completed),
+            total.holiday = sum(holiday),
+            total.days = max(as.Date(date)) - min(as.Date(date)))
+
+# Fetching user minimum date - date the user first logged onto the system 
+usermindate <- cards %>%
+  group_by(id) %>%
+  summarise(mindate = min(as.Date(date))) 
+# converting the date to an appropriate format
+str(usermindate)
+cards$date <- as.Date(cards$date)
+
+#creation of synthetic variable to capture user's early behavior
+user.early.6mth <- sqldf("SELECT cards.id, 
+          sum(entered) AS earlyentered, 
+          sum(onsite) AS earlyminutes, 
+          sum(completed) AS earlycompleted, 
+          sum(holiday) AS earlyholiday
+          from cards INNER JOIN usermindate
+          ON cards.id = usermindate.id
+          AND cards.date BETWEEN mindate AND mindate + 180 
+          GROUP BY cards.id")
+
+# checking for observations that have cancelled and resubscribed
+user.churn.status <- cards  %>% group_by(id) %>% mutate(rank = order(date, decreasing=TRUE)) %>% filter(rank == 1) %>% select(id,Churn,gender) 
+
+# Adding potential derived variables 
+# pages.per.min - Total user minutes/Total Number of pages visted by user
+# completed.ratio - Total orders Completed by user/Total number of trials user entered the order path
+# holiday.ratio -Total number of completed orders by user which included at least 1 holiday card/Total number of completed orders by user
+# entered.per.min - Total number of trials user entered the order path/Total user minutes
+# pages.per.entered - Total Number of pages visted by user/Total number of trials user entered the order path
+user.cards = cards.resp %>% inner_join(user.churn.status, by = "id") %>% 
+  mutate(pages.per.min = total.minutes/total.pages, 
+         completed.ratio = total.completed/total.entered, 
+         holiday.ratio = total.holiday/total.completed, 
+         completed.per.min = total.completed/total.minutes, 
+         entered.per.min = total.entered/total.minutes, 
+         pages.per.entered = total.pages/total.entered,
+         total.months = round(total.days/30,digits=0)) 
+
+
+# Joining our first 6 months data to the user.cards data 
+user.cards = user.cards %>% inner_join(user.early.6mth, by = "id") 
+
+# Reordering variables in a logical order
+user.cards <- user.cards %>% select(id, Churn, gender, everything())
+
+# Converting total.days to numeric for sanity
+user.cards$total.days <- as.numeric(user.cards$total.days)
+# Converting total.months to numeric for sanity
+user.cards$total.months <- as.numeric(user.cards$total.months)
+
+# Creating a list of continous variables
+cont.list=c("total.pages","total.minutes","total.entered","total.completed",
+           "total.holiday", "total.days", "pages.per.min", "completed.ratio", "holiday.ratio", "completed.per.min", "entered.per.min","pages.per.entered"
+           ,"earlyentered", "earlycompleted", "earlyholiday", "earlyminutes", "total.months")
+
+# Creating a list for categorical variable gender
+cat.list=c("gender")
+
+# Printing a row to observe the data
+print(user.cards[1,cont.list])
+
+
+# Describe the data based for the continuous parameters
+describe(user.cards[,cont.list],fast=TRUE)   
+
+# Describe the data by the group churn for the continuous parameters
+describeBy(user.cards[,cont.list],group=user.cards$Churn,fast=TRUE)
+
+
+
+```
+Above shows the statistics of the ltv data. 
+
+##Data Visualization
+
+We have plotted boxplots to visualize the data based on the different features. 
+```{r}
+# boxplots for the various variable we have
+par(mfrow=c(3,4))
+boxplot(total.pages ~Churn,data=user.cards,xlab="Churn",ylab="total.pages")
+boxplot(total.minutes ~Churn,data=user.cards,xlab="Churn",ylab="total.minutes")
+boxplot(total.entered ~Churn,data=user.cards,xlab="Churn",ylab="total.entered")
+boxplot(total.holiday ~Churn,data=user.cards,xlab="Churn",ylab="total.holiday")
+boxplot(total.days ~ Churn,data=user.cards,xlab="Churn",ylab="Tenure")
+boxplot(pages.per.min ~ Churn,data=user.cards,xlab="Churn",ylab="Pages per minute")
+boxplot(completed.ratio ~ Churn,data=user.cards,xlab="Churn",ylab="Completed ratio")
+boxplot(holiday.ratio ~ Churn,data=user.cards,xlab="Churn",ylab="Holiday ratio")
+boxplot(completed.per.min ~ Churn,data=user.cards,xlab="Churn",ylab="Completed per minute")
+boxplot(entered.per.min ~ Churn,data=user.cards,xlab="Churn",ylab="Entered per minute")
+boxplot(pages.per.entered ~ Churn,data = user.cards,xlab="Churn",ylab="Pages per entered order")
+
+
+# Create a cross tabulation to see gender with respect to churners
+xtabs(~user.cards$gender+user.cards$Churn,data=user.cards)
+
+# Print a correllation matrix
+user.cards <- sapply( user.cards, as.numeric )
+(corr.output <- round(cor(user.cards[,cont.list],use="pairwise.complete.obs"),digits=2))
+
+```
+
+- As shown above, it can be seen that the feature characteristics are different for users who churn vs no churn. This gives us a good visual reinforcement that these variable are predictive of churn customers. 
+- The gender table shows the proportion of males and females who have churned and not churned. 
+- We have also got the correlation matrix which shows which features are highly correlated. From the matrix, it can be seen that a number of variables are not highly correlated and we can proceed to use these in the model. 
+
+##Question 1 - The Attrition Model
+
+##Attrition Model 1 - Logistic Regression
+
+- Firstly, we perform a 10-fold cross validation to do variable selection. 
+- We proceed to apply a logistic fit on it and we print out the CV scores and the summary. 
+- We reselect variables based on the above and put it inside a dataframe called user.cards.refined
+- We plot the collinearity again for user.cards.refined
+- 
+
+
+```{r}
+# Define the training control parameters, we are choosing 10-fold cross validation
+train.control<- trainControl(method="cv", number=10, savePredictions = T)
+
+# train the model by applying a logistic regression on it
+user.cards = data.frame(user.cards)
+#user.cards = user.cards %>% inner_join(user.early.6mth, by = "id")##added and renamed to user.cards1
+model.lr <- train(Churn ~ ., data=user.cards, trControl=train.control, method="glm", family=binomial(link = "logit"))
+# print cv scores
+varImp(model.lr)
+
+summary(model.lr)
+
+# selecting and refining variables that minimize test error
+user.cards.refined <-select(user.cards,Churn, total.entered, total.completed, total.holiday, total.days,completed.ratio, holiday.ratio)
+
+# Print a correllation matrix again to check correllation across parameters
+(corr.output.ref <- round(cor(user.cards.refined[,-1],use="pairwise.complete.obs"),digits=2))
+
+user.cards.refined <- user.cards.refined %>% select(Churn, total.entered, total.days, completed.ratio, holiday.ratio)
+
+#Collinearity plots
+predictorVariables <-colnames(user.cards.refined)
+panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...)
+{
+    usr <- par("usr"); on.exit(par(usr))
+    par(usr = c(0, 1, 0, 1))
+    r <- abs(cor(x, y))
+    txt <- format(c(r, 0.123456789), digits = digits)[1]
+    txt <- paste0(prefix, txt)
+    if(missing(cex.cor)) cex.cor <- 0.8/strwidth(txt)
+    text(0.5, 0.5, txt, cex = cex.cor * r)
+}
+# As it turns out total.entered, total.completed and total.holiday are highly correlated
+pairs(user.cards.refined[,predictorVariables], lower.panel = panel.cor)
+
+
+```
+- We run a logistic fit again on the refined variables and get the predicted values
+- We choose a cutoff = 0.7 as we would like to improve the sensitivity (= TP/(TP + FN) of our model
+- This is because we care more about our False Negatives(people who actually churn but our model predicts them as non-churn) than False Negatives(people who actually do not churn but our model predicts them as churning)
+- This approach tries to reduce False Negatives and increase True Positives which is our motive. 
+- We plot a confusion matrix and the ROC plot
+
+```{r}
+
+# We chose total.entered in the model since we have other ratios that explain the % completed, % holiday
+model.lr2 <- train(Churn ~ ., data=user.cards.refined, trControl=train.control, method="glm", family=binomial(link = "logit"))
+
+summary(model.lr2)
+
+# Getting a predicted score based on our model
+pred.cards <- model.lr2$finalModel$fitted.values
+
+# Predict function to classify probabilities based on an input cutoff
+pred.fac.cutoff <- function(x) ifelse(pred.cards > x , 1,0) 
+
+# Choosing a cutoff of 70%  since that gives us the highest sensitivity
+confusionMatrix(pred.fac.cutoff(0.7),user.cards.refined$Churn)
+
+# compute predictions for the train sample
+pred.churn = pred.fac.cutoff(0.7)
+
+true.churn= user.cards.refined$Churn
+
+roc.lr <- roc(true.churn, pred.churn)
+
+# Plotting the ROC curve
+plot(roc.lr, print.auc = TRUE, col = "steelblue")
+
+```
+
+`Data Visualization`
+- We plot the log(oddsratio of churn) and probability for various variables.
+- We also proceed to create a visualization using visreg to create two effects
+- REMAINING (comment on accuracy of the model and other results)
+
+```{r}
+# Plotting the logodds and odds for the various variables
+par(mfrow=c(2,1))
+visreg(model.lr2,"total.entered",ylab="Log(OddsRatio of Churn)")
+visreg(model.lr2,"total.entered",ylab="Pr(Churn)")
+
+par(mfrow=c(2,1))
+visreg(model.lr2,"total.days",ylab="Log(OddsRatio of Churn)")
+visreg(model.lr2,"total.days",ylab="Pr(Churn)")
+
+par(mfrow=c(2,1))
+visreg(model.lr2,"completed.ratio",ylab="Log(OddsRatio of Churn)")
+visreg(model.lr2,"completed.ratio",ylab="Pr(Churn)")
+
+par(mfrow=c(2,1))
+visreg(model.lr2,"holiday.ratio",ylab="Log(OddsRatio of Churn)")
+visreg(model.lr2,"holiday.ratio",ylab="Pr(Churn)")
+
+# create a visualization using visreg to create two effects at the same time 
+par(mfrow=c(2,1))
+visreg2d(model.lr2,"total.days","completed.ratio",plot.type="image",main="Log(OddsRatio of Adopt)")
+visreg2d(model.lr2,"total.days","completed.ratio",plot.type="image",main="Pr(Adopt)")
+```
+
+## Attrition Model 2 - Random Forest
+Reference:https://www.r-bloggers.com/random-forests-in-r/
+
+- We now proceed to fit a random forest model. 
+- Create a train sample of 8000 and fit the model on it. 
+- The random forest selects 6 random variables at each split.
+
+```{r, cache = true, warning=FALSE}
+set.seed(101)
+#create a train sample of 8000. 
+train=sample(1:nrow(user.cards),8000)
+
+#Random forest use 6 variables at each split
+(Churn.rf=randomForest(Churn ~ . , data = user.cards, subset=train,importance=TRUE))
+```
+
+`Data Visualization for Random Forest`
+- We have plotted error vs number of trees graph.
+- We have tried all 14 predictors by running a loop and calculating the out of bag error and test error.
+- These errors have been plotted corresponding to each variable selected. 
+- 
+```{r , cache = TRUE, warning=F}
+#Plotting the Error vs Number of Trees Graph.
+plot(Churn.rf)
+#Gini Index
+varImpPlot(Churn.rf)
+outofbag.err=double(14)
+test.err=double(14)
+
+#fitting model on each of the variables (This is just to display how it has selected those variables.)
+for(mtry in 1:14) 
+{
+  rf=randomForest(Churn ~ . , data = user.cards , subset = train,mtry=mtry,ntree=400) 
+  #outof bag error
+  outofbag.err[mtry] = rf$mse[400] 
+  
+  #Predictions on Test Set for each Tree
+  pred<-predict(rf,user.cards[-train,]) 
+  #Mean Squared Test Error
+  test.err[mtry]= with(user.cards[-train,], mean( (Churn - pred)^2)) 
+}
+par(mfrow=c(1,1))
+
+#plotting the error graph
+matplot(1:mtry , cbind(outofbag.err,test.err) ,pch=18, col=c("green","red"),type="b",ylab="Mean Squared Error",xlab="Number of Predictors Considered at each Split")
+legend("topright",legend=c("Out of Bag Error","Test Error"), pch=18, col=c("green","red"))
+```
+
+##Question 2: CLV Model - Linear Regression Model
+- First of all, we used best subset selection to rank the predictors.
+- Then we have selected top 5 predictors from the above list.
+- Then we have plotted the RSS and R-Squared plot.
+```{r, cache = TRUE}
+#best subset selection
+user.cards= data.frame(user.cards)
+user.cards.bestsubset <- regsubsets(total.months ~ .,
+               data = user.cards,
+               nbest = 1,    # 1 best model for each number of predictors
+               nvmax = NULL,    
+               method = "exhaustive", really.big = TRUE)
+
+#selecting top 5 predictors
+for(i in 1:5){
+  print(coef(user.cards.bestsubset, id = i), col.names = paste("Model Size",i))
+}
+
+#plotting rss and rsq graph
+plot(summary(user.cards.bestsubset)$rss ,xlab="Model Size",ylab="RSS",type="l")
+plot(summary(user.cards.bestsubset)$rsq ,xlab="Model Size",ylab="R-Squared",type="l")
+```
+
+- Fit the Linear Regression model using the above selected variables
+
+```{r}
+user.cards.bestparameters=user.cards[, c('total.holiday','total.days', 'pages.per.min','earlyentered',  'earlyminutes','total.months')]
+user.cards.fit = lm(formula=total.months~.,data=user.cards.bestparameters)
+
+
+```
+
+`Data Visualization for Linear regression`
+```{r}
+kable(summary(user.cards.fit)$coef,digits = c(3, 3, 3, 4), format = 'markdown')
+```
+
+
+##Question 3: Clustering
+
+- `Clustering Exercise`: In this section, we will explore different segmentation techniques with the following objectives
+    + `Data used for clustering`: We use normalized metrics based on the number of months a customer has spent on the system. We created variables at a monthly level such as `monthly.entered`, `monthly.completed` ,`monthly.holiday` , `monthly.minutes` and `monthly.pages`
+    +  `Data used for validation of our clusters`: Our focus in this section, is to identify sleeping customers who have not churned. We definev`sleeping customer` flag if a customer who has been inactive for 1, 3 and 6 months from the sample end date has not churned
+    + For e.g. a customer who has been inactive for 6 months and has not churned (Churn flag is not set) will have `sleeping.6mth' as 1
+    + `Methods`: We will explore two clustering schemes - `Hierarchical` (Agglomerative) and `K-means` clustering
+    
+#### Hierarchical Clustering
+
+    
+```{r, warning = F}
+# Hierarchical clustering
+
+# DATA PREPARATION TO CREATE SLEEPING CUSTOMER FLAGS FOR 1 MONTH, 3 MONTHS AND 6 MONTHS
+
+# Getting the maximum date for our data
+sample.maxdate <- max(cards$date)
+
+# Setting date demarkations as sample max date - 30
+maxdateminus30 <- max(cards$date) - 30
+# Setting date demarkations as sample max date - 90
+maxdateminus90 <- max(cards$date) - 90  
+# Setting date demarkations as sample max date - 180
+maxdateminus180 <- max(cards$date) - 180
+
+# Finding users who are sleeping and have not churned
+
+# Step a: Getting customers inactive for 3,6 and 9 months
+user.sleeping <- cards %>% group_by(id) %>% summarise(maxdate = max(as.Date(date))) %>% mutate( sleeping.onemth = ifelse(maxdate < maxdateminus30,1,0), sleeping.threemth = ifelse(maxdate < maxdateminus90,1,0), sleeping.6mth = ifelse(maxdate < maxdateminus180, 1, 0)) 
+
+#Step b: Creating a flag for users that have not churned
+user.notchurn <- ifelse(user.cards$Churn == 0,1,0)
+
+# Adding it to our overall sleeping users data frame
+user.sleeping <- cbind(user.sleeping, user.notchurn)
+
+# Updating the flags to sleeping users who have not churned
+# We will use these flags to validate our clustering exercise
+
+user.sleeping <- user.sleeping %>% mutate(sleeping.onemth = sleeping.onemth * user.notchurn, sleeping.threemth = sleeping.threemth * user.notchurn,
+    sleeping.6mth = sleeping.6mth * user.notchurn)
+
+# We have 713 users who are inactive for a month from sample end date and have not churned
+sum(user.sleeping$sleeping.onemth)
+
+# We have 318 users who are inactive for a month from sample end date and have not churned
+sum(user.sleeping$sleeping.threemth)
+
+# We have 244 users who are inactive for a month from sample end date and have not churned
+sum(user.sleeping$sleeping.6mth)
+
+## DATA PREPARATION FOR CLUSTERING
+
+# Creating our data frame for our clustering excercise
+user.clusterdata <- user.cards %>% inner_join(user.sleeping,by ="id")
+
+# Lets try to normalize variables on tenure
+
+user.clusterdata$total.months <- as.numeric(user.clusterdata$total.months)
+
+# Creating variables by months - monthly entered, completed and holiday orders
+
+user.clusterdata <- user.clusterdata %>% mutate(monthly.pages = ifelse(total.months != 0,total.pages/total.months,0) , monthly.minutes = ifelse(total.months!=0,total.minutes/total.months,0), monthly.entered = ifelse(total.months!=0,total.entered/total.months,0), monthly.completed = ifelse(total.months!=0,total.completed/total.months,0), monthly.holiday = ifelse(total.months!=0,total.holiday/total.months,0)) 
+
+
+# Selecting only the derived variables we created
+
+user.clusterdata <- user.clusterdata %>% select(monthly.pages, monthly.minutes, monthly.entered, monthly.completed, monthly.holiday)
+
+# Scale the clustering dataset that we created
+scaled.cdata <- scale(user.clusterdata)
+
+user.clusters = hclust(dist(scaled.cdata),method="complete")
+
+# Plotting the clusters
+plot(user.clusters)
+
+# color the plot according to the churn
+ColorDendrogram(user.clusters,y=user.cards$Churn,branchlength=2)
+
+# We want 3 clusters
+hclust.cut = cutree(user.clusters,3)
+
+# Cross tabulation for our cluster assignments with sleeping users
+xtabs(~user.cards$Churn + hclust.cut)
+
+# One months sleeping users who have not churned
+xtabs(~ user.sleeping$sleeping.onemth + hclust.cut)
+
+# Two months sleeping users who have not churned
+xtabs(~ user.sleeping$sleeping.threemth + hclust.cut)
+
+# Three months sleeping users who have not churned
+xtabs(~ user.sleeping$sleeping.6mth + hclust.cut)
+
+```
+
+- We have chosen 3 clusters as our output and height `15`.     
+    + We have used `complete linkage` because we want all points in a cluster to be under the height we choose (15)
+- We see that `cluster 1` contains all users who are inactive. 
+- `At Different cuts and different linkages - Single and complete` - cluster `1` still contains most users in our population. We could choose to get more clusters with our users spread across clusters, but the agglomerative clustering classifies most of our base into cluster `1` even if we choose lower heights.
+- We are not comfortable with that interpretability tradeoff and we try K-means instead
+
+#### K-means Clustering
+
+```{r, warning=F}
+# K means segmentation
+set.seed(12570)
+
+# Scaling the data for our kmeans exercise
+user.kmeans <- scale(user.clusterdata)
+
+# compute multiple cluster solutions
+k2=kmeans(user.kmeans,centers=2)
+k3=kmeans(user.kmeans,centers=3)
+k4=kmeans(user.kmeans,centers=4)
+k5=kmeans(user.kmeans,centers=5)
+k6=kmeans(user.kmeans,centers=6)
+k7=kmeans(user.kmeans,centers=7)
+k8=kmeans(user.kmeans,centers=8)
+k9=kmeans(user.kmeans,centers=9)
+k10=kmeans(user.kmeans,centers=10)
+k15=kmeans(user.kmeans,centers=15)
+k20=kmeans(user.kmeans,centers=20)
+k30=kmeans(user.kmeans,centers=30)
+
+## Plotting error estimates - Between sum of squares (within cluster variation)
+
+# Setting labels
+k.labels = c(2:10,15,20,30)
+
+# Getting the within sum of squares estimation for each of the clusters
+k.wss=c(k2$tot.withinss,
+      k3$tot.withinss,k4$tot.withinss,k5$tot.withinss,k6$tot.withinss,
+      k7$tot.withinss,k8$tot.withinss,k9$tot.withinss,k10$tot.withinss,
+      k15$tot.withinss,k20$tot.withinss,k30$tot.withinss)
+
+# Plotting the elbow curve
+plot(k.labels,k.wss,type="l",main="Within SS for k-means")
+axis(side=1, at=c(0:30))
+
+# Restarting kmeans for optimal number of 7 clusters
+
+# Setting 20 random initializations to start with and iterated 20
+k7=kmeans(user.kmeans,centers=7, nstart =20, iter.max = 20)
+
+# Cross tabulation for our cluster assignments with sleeping users
+xtabs(~user.cards$Churn + k7$cluster)
+
+# One months sleeping users who have not churned
+xtabs(~ user.sleeping$sleeping.onemth + k7$cluster)
+
+# Two months sleeping users who have not churned
+xtabs(~ user.sleeping$sleeping.threemth + k7$cluster)
+
+# Three months sleeping users who have not churned
+xtabs(~ user.sleeping$sleeping.6mth + k7$cluster)
+
+# Preparing data for our cluster summaries
+cluster.summary <- data.frame(cbind( cluster = k7$cluster, user.clusterdata))   
+
+# Printing cluster summaries
+cluster.stats <- cluster.summary %>% group_by(cluster) %>% summarise(Monthly.entered.orders = round(mean(monthly.entered),digits = 0), Monthly.completed.orders = round(mean(monthly.completed), digits = 0), Monthly.holiday.orders = round(mean(monthly.holiday), digits = 0), Monthly.minutes = round(mean(monthly.minutes), digits =0), Monthly.pages.viewed = round(mean(monthly.pages), digits =0))
+
+# Print a cluster summary
+kable(cluster.stats, caption = "The Cluster Summaries using K-means")
+
+```
+
+ - `Inferences From the K-means analysis`
+      + `Sleeping customers`We can see that clusters `2`, `4` and `7` are segments that have a high number of users that are `1 month`, `3 month` and `6 month` inactive respectively as can be seen from the cross validation
+      + `Characteristics of cluster ouput for clusters 2, 4 and 7`: The `engagement` metrics for this clusters are shown in the table before. As we can see the users in these segments have score low on engagement. We can see that `4` contains the largest percentage of all sleeping customers and should be the `PRIORITY` segment. Segment `7` shows relatively higher monthly engagement metrics
+ 
